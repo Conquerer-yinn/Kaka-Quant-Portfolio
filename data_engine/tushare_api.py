@@ -1,0 +1,132 @@
+﻿import time
+
+import requests
+import tushare as ts
+
+from common.config import TUSHARE_HTTP_URL, TUSHARE_REQUEST_DELAY, TUSHARE_TOKEN
+
+
+class TushareDataEngine:
+    """Tushare 数据访问封装。"""
+
+    def __init__(self, token=None, http_url=None, request_delay=None, max_retries=3):
+        resolved_token = token or TUSHARE_TOKEN
+        if not resolved_token:
+            raise ValueError("TUSHARE_TOKEN is not configured.")
+
+        self.request_delay = (
+            TUSHARE_REQUEST_DELAY if request_delay is None else request_delay
+        )
+        self.max_retries = max_retries
+        self.pro = ts.pro_api(resolved_token)
+
+        # 兼容需要自定义 Tushare 网关的环境。
+        if http_url or TUSHARE_HTTP_URL:
+            self.pro._DataApi__token = resolved_token
+            self.pro._DataApi__http_url = http_url or TUSHARE_HTTP_URL
+
+    def get_trade_calendar(self, start_date, end_date, exchange="SSE"):
+        # 交易日历是所有增量任务的时间基准。
+        df = self._call_with_retry(
+            self.pro.trade_cal,
+            exchange=exchange,
+            start_date=start_date,
+            end_date=end_date,
+            is_open=1,
+        )
+        if df.empty:
+            return []
+        return sorted(df["cal_date"].astype(str).tolist())
+
+    def get_daily_quotes(self, trade_date):
+        # 日线行情是大多数市场指标的基础表。
+        return self._call_with_retry(self.pro.daily, trade_date=trade_date)
+
+    def get_daily_basic(self, trade_date, fields=None):
+        # 日线基础指标主要补充换手率、市值等字段。
+        request_fields = fields or "ts_code,trade_date,turnover_rate,circ_mv"
+        return self._call_with_retry(
+            self.pro.daily_basic,
+            trade_date=trade_date,
+            fields=request_fields,
+        )
+
+    def get_limit_list(self, trade_date):
+        # limit_list_d 同时包含涨停、跌停、炸板等连板信息。
+        return self._call_with_retry(self.pro.limit_list_d, trade_date=trade_date)
+
+    def get_stk_limit(self, trade_date):
+        # stk_limit 提供涨跌停价格，用于回退判断炸板。
+        return self._call_with_retry(self.pro.stk_limit, trade_date=trade_date)
+
+    def get_index_daily(self, ts_code, start_date=None, end_date=None, trade_date=None):
+        # 指数日线主要用于竞价卡片里的开盘强弱判断。
+        kwargs = {"ts_code": ts_code}
+        if trade_date:
+            kwargs["trade_date"] = trade_date
+        else:
+            kwargs["start_date"] = start_date
+            kwargs["end_date"] = end_date
+        return self._call_with_retry(self.pro.index_daily, **kwargs)
+
+    def get_stock_basic(self, fields=None):
+        # 股票基础信息主要用于过滤 ST、次新股和划分板块。
+        request_fields = fields or "ts_code,name,list_date,market"
+        return self._call_with_retry(
+            self.pro.stock_basic,
+            exchange="",
+            list_status="L",
+            fields=request_fields,
+        )
+
+    def get_stock_open_auction(self, trade_date):
+        # 开盘集合竞价数据适合做竞价卡片的盘后复盘版本。
+        return self._call_with_retry(self.pro.stk_auction_o, trade_date=trade_date)
+
+    def get_realtime_index_quotes(self, ts_code):
+        # 实时指数快照用于盘中节奏卡片。
+        return self._call_with_retry(self.pro.rt_idx_k, ts_code=ts_code)
+
+    def get_realtime_stock_quotes(self, ts_code=None):
+        # 实时股票快照优先尝试全市场，不支持时由上层做降级处理。
+        kwargs = {}
+        if ts_code:
+            kwargs["ts_code"] = ts_code
+        return self._call_with_retry(self.pro.rt_k, **kwargs)
+
+    def _call_with_retry(self, api_func, **kwargs):
+        # Tushare 常见失败是限流和超时，这里统一做轻量重试。
+        last_error = None
+        for attempt in range(1, self.max_retries + 1):
+            self._sleep_if_needed()
+            try:
+                return api_func(**kwargs)
+            except Exception as exc:
+                last_error = exc
+                if not self._should_retry(exc) or attempt == self.max_retries:
+                    raise
+
+                wait_seconds = max(self.request_delay, 1) * (2 ** attempt)
+                print(f"Tushare request failed on attempt {attempt}: {exc}. Retrying in {wait_seconds:.1f}s ...")
+                time.sleep(wait_seconds)
+
+        raise last_error
+
+    def _should_retry(self, exc):
+        message = str(exc)
+        retry_keywords = [
+            "请求上限",
+            "Max retries exceeded",
+            "Failed to establish a new connection",
+            "每分钟最多访问该接口",
+            "请求过于频繁",
+            "请求超时",
+        ]
+        if any(keyword in message for keyword in retry_keywords):
+            return True
+        return isinstance(exc, requests.exceptions.RequestException)
+
+    def _sleep_if_needed(self):
+        # 每次请求前做最小延迟，避免连续高频触发限流。
+        if self.request_delay and self.request_delay > 0:
+            time.sleep(self.request_delay)

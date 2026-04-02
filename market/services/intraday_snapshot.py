@@ -1,0 +1,232 @@
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any
+
+import pandas as pd
+
+from data_engine.tushare_api import TushareDataEngine
+
+
+INDEX_CODES = "000001.SH,399001.SZ,399006.SZ"
+INDEX_CODE_MAP = {
+    "000001.SH": "sse_index_pct",
+    "399001.SZ": "szse_index_pct",
+    "399006.SZ": "chinext_index_pct",
+}
+TODAY_ONLY_ERROR = "盘中节奏卡片当前只支持当日实时推送。"
+
+
+def build_intraday_snapshot_from_raw(trade_date: str | None = None) -> dict[str, Any]:
+    """基于实时接口构造盘中节奏卡片快照。"""
+    today = datetime.now().strftime("%Y%m%d")
+    target_date = trade_date or today
+    if target_date != today:
+        raise ValueError(TODAY_ONLY_ERROR)
+
+    engine = TushareDataEngine()
+    notes = []
+    try:
+        index_df = engine.get_realtime_index_quotes(INDEX_CODES)
+        if index_df is None or index_df.empty:
+            raise ValueError("Failed to fetch realtime index quotes.")
+        index_snapshot = _build_index_snapshot(index_df)
+    except Exception as exc:
+        # 实时指数权限不足时，先回退到当日日线口径，保证卡片能发。
+        index_snapshot = _build_index_fallback(engine, target_date)
+        notes.append(f"Tushare 实时指数接口受限，已回退到当日日线口径：{exc}")
+
+    snapshot = {
+        "date": today,
+        "time_point": index_snapshot.get("time_point"),
+        "sse_index_pct": index_snapshot.get("sse_index_pct"),
+        "szse_index_pct": index_snapshot.get("szse_index_pct"),
+        "chinext_index_pct": index_snapshot.get("chinext_index_pct"),
+        "estimated_turnover_yi": None,
+        "up_count": None,
+        "down_count": None,
+        "limit_up_count": None,
+        "limit_down_count": None,
+        "broken_limit_count": None,
+        "highest_streak": None,
+        "style_text": "",
+        "risk_text": "",
+        "availability_note": "",
+    }
+
+    market_note = _try_fill_realtime_market_snapshot(engine, snapshot)
+    if market_note:
+        notes.append(market_note)
+    snapshot["style_text"] = build_intraday_style_text(snapshot)
+    snapshot["risk_text"] = build_intraday_risk_text(snapshot)
+    snapshot["availability_note"] = "；".join(notes) if notes else "当前盘中卡片已接入实时指数与尽力版市场宽度。"
+    return snapshot
+
+
+def build_intraday_style_text(snapshot: dict[str, Any]) -> str:
+    """生成盘中节奏判断。"""
+    chinext_pct = snapshot.get("chinext_index_pct")
+    sse_pct = snapshot.get("sse_index_pct")
+    up_count = snapshot.get("up_count")
+    down_count = snapshot.get("down_count")
+
+    parts = []
+    if up_count is not None and down_count is not None:
+        if up_count > down_count * 1.3:
+            parts.append("市场呈现普涨节奏")
+        elif down_count > up_count * 1.3:
+            parts.append("市场整体承压")
+        else:
+            parts.append("市场分歧偏均衡")
+    elif sse_pct is not None:
+        if sse_pct >= 1:
+            parts.append("指数端走强")
+        elif sse_pct <= -1:
+            parts.append("指数端偏弱")
+        else:
+            parts.append("指数端中性震荡")
+
+    if chinext_pct is not None:
+        if chinext_pct >= 1:
+            parts.append("创业板领涨")
+        elif chinext_pct <= -1:
+            parts.append("创业板承压")
+
+    estimated_turnover_yi = snapshot.get("estimated_turnover_yi")
+    if estimated_turnover_yi is not None:
+        parts.append(f"按当前节奏预计成交额约 {estimated_turnover_yi:.0f} 亿")
+
+    return "，".join(parts)
+
+
+def build_intraday_risk_text(snapshot: dict[str, Any]) -> str:
+    """生成盘中风险提示。"""
+    risks = []
+    limit_down_count = snapshot.get("limit_down_count")
+    broken_limit_count = snapshot.get("broken_limit_count")
+    chinext_pct = snapshot.get("chinext_index_pct")
+
+    if limit_down_count is not None and limit_down_count >= 10:
+        risks.append("跌停家数增加")
+    if broken_limit_count is not None and broken_limit_count >= 10:
+        risks.append("炸板明显增多")
+    if chinext_pct is not None and chinext_pct <= -1:
+        risks.append("创业板回落较快")
+
+    if not risks:
+        return "当前未出现特别突出的盘中风险项，继续观察高位股承接和炸板变化。"
+    return "，".join(risks) + "。"
+
+
+def _build_index_snapshot(index_df: pd.DataFrame) -> dict[str, Any]:
+    snapshot = {"time_point": None}
+    for ts_code, field_name in INDEX_CODE_MAP.items():
+        row_df = index_df[index_df["ts_code"] == ts_code]
+        if row_df.empty:
+            snapshot[field_name] = None
+            continue
+        row = row_df.iloc[0]
+        pre_close = row.get("pre_close")
+        close = row.get("close")
+        if pre_close in (None, 0) or close is None:
+            snapshot[field_name] = None
+        else:
+            snapshot[field_name] = round((float(close) / float(pre_close) - 1) * 100, 2)
+
+        trade_time = row.get("trade_time")
+        if trade_time:
+            snapshot["time_point"] = str(trade_time)[11:16]
+    return snapshot
+
+
+def _build_index_fallback(engine: TushareDataEngine, trade_date: str) -> dict[str, Any]:
+    snapshot = {"time_point": datetime.now().strftime("%H:%M")}
+    for ts_code, field_name in INDEX_CODE_MAP.items():
+        daily_df = engine.get_index_daily(ts_code=ts_code, trade_date=trade_date)
+        if daily_df is None or daily_df.empty:
+            snapshot[field_name] = None
+            continue
+        row = daily_df.iloc[0]
+        pre_close = row.get("pre_close")
+        close = row.get("close")
+        if pre_close in (None, 0) or close is None:
+            snapshot[field_name] = None
+        else:
+            snapshot[field_name] = round((float(close) / float(pre_close) - 1) * 100, 2)
+    return snapshot
+
+
+def _try_fill_realtime_market_snapshot(engine: TushareDataEngine, snapshot: dict[str, Any]) -> str:
+    # 实时全市场快照权限波动较大，这里按“能取到就补，取不到就降级”的思路处理。
+    try:
+        rt_df = engine.get_realtime_stock_quotes()
+    except Exception as exc:
+        return f"当前盘中卡片先用指数口径构造；全市场实时宽度未接入，原因：{exc}"
+
+    if rt_df is None or rt_df.empty:
+        return "当前盘中卡片先用指数口径构造；全市场实时宽度返回为空。"
+
+    required_columns = {"ts_code", "close", "pre_close", "amount", "high"}
+    if not required_columns.issubset(set(rt_df.columns)):
+        return "当前盘中卡片先用指数口径构造；实时股票快照字段不足，未展开宽度统计。"
+
+    today = snapshot["date"]
+    stk_limit_df = engine.get_stk_limit(today)
+
+    market_df = rt_df.copy()
+    market_df["pct_chg"] = ((market_df["close"] / market_df["pre_close"]) - 1) * 100
+    snapshot["up_count"] = int((market_df["pct_chg"] > 0).sum())
+    snapshot["down_count"] = int((market_df["pct_chg"] < 0).sum())
+    snapshot["estimated_turnover_yi"] = _estimate_full_day_turnover(market_df["amount"].sum())
+
+    if stk_limit_df is not None and not stk_limit_df.empty:
+        market_df = market_df.merge(
+            stk_limit_df[["ts_code", "up_limit", "down_limit"]],
+            on="ts_code",
+            how="left",
+        )
+        market_df["is_limit_up"] = (market_df["up_limit"].notna()) & (market_df["close"] >= market_df["up_limit"] - 1e-6)
+        market_df["is_limit_down"] = (market_df["down_limit"].notna()) & (market_df["close"] <= market_df["down_limit"] + 1e-6)
+        market_df["is_broken_limit"] = (
+            market_df["up_limit"].notna()
+            & (market_df["high"] >= market_df["up_limit"] - 1e-6)
+            & (market_df["close"] < market_df["up_limit"] - 1e-6)
+        )
+        snapshot["limit_up_count"] = int(market_df["is_limit_up"].sum())
+        snapshot["limit_down_count"] = int(market_df["is_limit_down"].sum())
+        snapshot["broken_limit_count"] = int(market_df["is_broken_limit"].sum())
+
+    return "当前盘中卡片已接入实时指数；全市场实时宽度为尽力统计，若权限受限会自动降级。"
+
+
+def _estimate_full_day_turnover(total_amount_k: Any) -> float | None:
+    if total_amount_k is None:
+        return None
+    try:
+        total_amount_k = float(total_amount_k)
+    except (TypeError, ValueError):
+        return None
+
+    now = datetime.now()
+    elapsed_ratio = _session_elapsed_ratio(now.hour * 60 + now.minute)
+    if elapsed_ratio <= 0:
+        return None
+    return round((total_amount_k / 1e5) / elapsed_ratio, 2)
+
+
+def _session_elapsed_ratio(total_minutes: int) -> float:
+    # A 股交易时段按 240 分钟估算，午休不计。
+    morning_start = 9 * 60 + 30
+    morning_end = 11 * 60 + 30
+    afternoon_start = 13 * 60
+    afternoon_end = 15 * 60
+
+    if total_minutes <= morning_start:
+        return 0
+    if total_minutes <= morning_end:
+        return (total_minutes - morning_start) / 240
+    if total_minutes <= afternoon_start:
+        return 120 / 240
+    if total_minutes <= afternoon_end:
+        return (120 + total_minutes - afternoon_start) / 240
+    return 1
